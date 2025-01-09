@@ -1,0 +1,446 @@
+---
+title: "Company Segmentation"
+author: "Elshan"
+date: "10/09/2021"
+output: 
+    html_document:
+        toc: TRUE
+        theme: flatly
+        highlight: tango
+        code_folding: show
+        df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE
+    )
+```
+
+NOTE: On the RIGHT TOP CORNER you will have a code button. You can click that button to __show the code__ or __hide the code__
+
+# Challenge Summary
+
+__Your organization wants to know which companies are similar to each other to help in identifying potential customers of a SAAS software solution (e.g. Salesforce CRM or equivalent) in various segments of the market. The Sales Department is very interested in this analysis, which will help them more easily penetrate various market segments.__
+
+I will be using stock prices in this analysis. I come up with a method to classify companies based on how their stocks trade using their daily stock returns (percentage movement from one day to the next). This analysis will help my organization determine which companies are related to each other (competitors and have similar attributes). 
+
+I can analyze the stock prices using what I've learned in the unsupervised learning tools including K-Means and UMAP. I will use a combination of `kmeans()` to find groups and `umap()` to visualize similarity of daily stock returns.
+
+# Objectives
+
+Apply my knowledge on K-Means and UMAP along with `dplyr`, `ggplot2`, and `purrr` to create a visualization that identifies subgroups in the S&P 500 Index. I will specifically apply:
+
+- Modeling: `kmeans()` and `umap()`
+- Iteration: `purrr`
+- Data Manipulation: `dplyr`, `tidyr`, and `tibble`
+- Visualization: `ggplot2` (bonus `plotly`)
+
+
+# Libraries
+
+Load the following libraries. If you have never used `plotly` for interactive plotting, you will need to install with `install.packages("plotly")`.
+
+
+```{r}
+# install.packages("plotly")
+
+library(tidyverse)
+library(tidyquant)
+library(broom)
+library(umap)
+library(plotly)
+library(ggrepel)
+```
+
+
+# Data
+
+I will be using stock prices in this analysis. The `tidyquant` R package contains an API to retreive stock prices. The following code is shown so you can see how I obtained the stock prices for every stock in the S&P 500 index. 
+
+```{r, eval = FALSE}
+# 
+# GET ALL STOCKS IN A STOCK INDEX (E.G. SP500)
+sp_500_index_tbl <- tq_index("SP500")
+sp_500_index_tbl
+
+# PULL IN STOCK PRICES FOR EACH STOCK IN THE INDEX
+sp_500_prices_tbl <- sp_500_index_tbl %>%
+    select(symbol) %>%
+    tq_get(get = "stock.prices")
+# 
+# # SAVING THE DATA
+# fs::dir_create("../Company_Segmentation/my_challange")
+# sp_500_prices_tbl %>% write_rds(path = "../Company_Segmentation/my_challange/sp_500_prices_tbl.rds")
+# sp_500_index_tbl %>% write_rds("../Company_Segmentation/my_challange/sp_500_index_tbl.rds")
+```
+
+We can read in the stock prices. The data is 1.2M observations. The most important columns for our analysis are:
+
+- `symbol`: The stock ticker symbol that corresponds to a company's stock price
+- `date`: The timestamp relating the symbol to the share price at that point in time
+- `adjusted`: The stock price, adjusted for any splits and divdends (we use this when analyzing stock data over long periods of time) 
+
+I am adding import the data for any case if you could not download the data.
+
+```{r}
+# STOCK PRICES
+# sp_500_prices_tbl <- read_rds("my_challange/sp_500_prices_tbl.rds")
+# sp_500_prices_tbl
+```
+
+The second data frame contains information about the stocks the most important of which are:
+
+- `company`: The company name
+- `sector`: The sector that the company belongs to
+
+I am adding import the data for any case if you could not download the data.
+
+```{r}
+# SECTOR INFORMATION
+# sp_500_index_tbl <- read_rds("my_challange/sp_500_index_tbl.rds")
+# sp_500_index_tbl
+```
+
+
+# Question
+
+<mark>Which stock prices behave similarly?</mark>
+
+Answering this question helps us __understand which companies are related__, and we can use clustering to help us answer it!
+
+Even if you're not interested in finance, this is still a great analysis because it will tell you which companies are competitors and which are likely in the same space (often called sectors) and can be categorized together. Bottom line - This analysis can help us better understand the dynamics of the market and competition, which is useful for all types of analyses from finance to sales to marketing.  
+
+Let's get started. 
+
+## Step 1 - Convert stock prices to a standardized format (daily returns)
+
+What I first need to do is get the data in a format that can be converted to a "user-item" style matrix. The challenge here is to connect the dots between what I have and what I need to do to format it properly.
+
+I know that in order to compare the data, it needs to be standardized or normalized. Why? Because I cannot compare values (stock prices) that are of completely different magnitudes. In order to standardize, I will convert from adjusted stock price (dollar value) to daily returns (percent change from previous day). Here is the formula. 
+
+$$ 
+return_{daily} = \frac{price_{i}-price_{i-1}}{price_{i-1}}
+$$
+
+First, what do we have? We have stock prices for every stock in the [SP 500 Index](https://finance.yahoo.com/quote/%5EGSPC?p=%5EGSPC), which is the daily stock prices for over 500 stocks. The data set is over 1.2M observations. 
+
+```{r}
+sp_500_prices_tbl %>% glimpse()
+```
+
+My first task is to convert to a tibble named `sp_500_daily_returns_tbl` by performing the following operations:
+
+- Select the `symbol`, `date` and `adjusted` columns
+- Filter to dates beginning in the year 2018 and beyond. 
+- Compute a Lag of 1 day on the adjusted stock price. Be sure to group by symbol first, otherwise we will have lags computed using values from the previous stock in the data frame. 
+- Remove an `NA` values from the lagging operation
+- Compute the difference between adjusted and the lag
+- Compute the percentage difference by dividing the difference by that lag. Name this column `pct_return`.
+- Return only the `symbol`, `date`, and `pct_return` columns
+- Save as a variable named `sp_500_daily_returns_tbl`
+
+```{r}
+# Apply your data transformation skills!
+sp_500_daily_returns_tbl <- 
+    sp_500_prices_tbl %>% select(symbol,date,adjusted) %>% 
+    mutate(year = year(date)) %>% 
+    filter(year >= 2018) %>% 
+    group_by(symbol) %>% 
+    mutate(lag_1 = lag(adjusted, n = 1)) %>% 
+    filter(!is.na(lag_1)) %>% 
+    ungroup() %>% 
+    mutate(diff = adjusted - lag_1) %>% 
+    mutate(pct_return = diff / lag_1) %>% 
+    select(symbol,date,pct_return)
+
+
+# Output: 
+sp_500_daily_returns_tbl
+```
+
+
+## Step 2 - Convert to User-Item Format
+
+The next step is to convert to a user-item format with the `symbol` in the first column and every other column the value of the _daily returns_ (`pct_return`) for every stock at each `date`.
+
+
+Now that we have the daily returns (percentage change from one day to the next), we can convert to a user-item format. The user in this case is the `symbol` (company), and the item in this case is the `pct_return` at each `date`. 
+
+- Spread the `date` column to get the values as percentage returns. Make sure to fill an `NA` values with zeros. 
+- Save the result as `stock_date_matrix_tbl`
+
+```{r}
+# Convert to User-Item Format
+stock_date_matrix_tbl <- 
+    sp_500_daily_returns_tbl %>% 
+    spread(key = date, value = pct_return,fill = 0)
+
+# Output: 
+stock_date_matrix_tbl
+```
+
+
+
+## Step 3 - Perform K-Means Clustering
+
+Next, we'll perform __K-Means clustering__. 
+
+Beginning with the `stock_date_matrix_tbl`, perform the following operations:
+
+- Drop the non-numeric column, `symbol`
+- Perform `kmeans()` with `centers = 4` and `nstart = 20`
+- Save the result as `kmeans_obj`
+
+```{r}
+kmeans_obj <- 
+    stock_date_matrix_tbl %>% 
+    select(-symbol) %>% 
+    kmeans(centers = 4 ,nstart = 20)
+# Create kmeans_obj for 4 centers
+
+#tidy(kmeans_obj) %>% glimpse()
+# glance(kmeans_obj)
+# 
+# kmeans_obj$cluster
+# kmeans_obj$tot.withinss
+# kmeans_obj$withinss
+```
+
+Use `glance()` to get the `tot.withinss`. 
+
+```{r}
+# Apply glance() to get the tot.withinss
+glance(kmeans_obj)
+```
+
+## Step 4 - Find the optimal value of K
+
+
+We'll use this __custom function__ called `kmeans_mapper()`:
+
+```{r}
+kmeans_mapper <- function(center = 3) {
+    stock_date_matrix_tbl %>%
+        select(-symbol) %>%
+        kmeans(centers = center, nstart = 20)
+}
+```
+
+Apply the `kmeans_mapper()` and `glance()` functions iteratively using `purrr`.
+
+- Create a tibble containing column called `centers` that go from 1 to 30
+- Add a column named `k_means` with the `kmeans_mapper()` output. Use `mutate()` to add the column and `map()` to map centers to the `kmeans_mapper()` function.
+- Add a column named `glance` with the `glance()` output. Use `mutate()` and `map()` again to iterate over the column of `k_means`.
+- Save the output as `k_means_mapped_tbl` 
+
+
+```{r}
+# Use purrr to map
+k_means_mapped_tbl <- 
+    tibble(centers = 1:30) %>% 
+    mutate(k_means = centers %>% map(kmeans_mapper)) %>% 
+    mutate(glance = k_means %>% map(glance))
+
+# Output: 
+k_means_mapped_tbl 
+```
+
+Next, let's visualize the "tot.withinss" from the glance output as a ___Scree Plot___. 
+
+- Begin with the `k_means_mapped_tbl`
+- Unnest the `glance` column
+- Plot the `centers` column (x-axis) versus the `tot.withinss` column (y-axis) using `geom_point()` and `geom_line()`
+- Add a title "Scree Plot" and feel free to style it with your favorite theme
+
+```{r}
+# Visualize Scree Plot
+k_means_mapped_tbl %>% 
+    unnest(glance) %>% 
+    ggplot(aes(centers, tot.withinss)) +
+    geom_point(size = 3, color = "blue") +
+    geom_line(size = 1) +
+    geom_label_repel(aes(label = centers),size = 3,position = "identity")+
+    theme_tq()
+```
+
+We can see that the Scree Plot becomes linear (constant rate of change) between 5 and 10 centers for K.
+
+
+## Step 5 - Apply UMAP
+
+Why we are using UMAP?
+UMAP (Uniform Manifold Approximation and Projection) is a dimensionality reduction technique used to visualize and analyze high-dimensional data in a low-dimensional space
+
+Key Features of UMAP:
+- Preserves Structure: UMAP excels at preserving the global and local structure of data better than many other techniques, such as PCA or t-SNE.
+- Scalable: It is computationally efficient and can handle large datasets effectively.
+- Versatile: UMAP works well for various data types, including numeric, categorical, and mixed data.
+- Interpretability: The reduced dimensions often reveal meaningful patterns or groupings in the data.
+Core Concepts:
+- Topology-Based Approach: UMAP builds a topological representation of the data using a nearest-neighbor graph.
+- Optimization: It optimizes a low-dimensional embedding of the graph to maintain the local relationships from the original high-dimensional space.
+
+Next, let's plot the `UMAP` 2D visualization to help us investigate cluster assignments. 
+
+
+First, let's apply the `umap()` function to the `stock_date_matrix_tbl`, which contains our user-item matrix in tibble format.
+
+- Start with `stock_date_matrix_tbl`
+- De-select the `symbol` column
+- Use the `umap()` function storing the output as `umap_results`
+```{r}
+# Apply UMAP
+umap_results <- 
+    stock_date_matrix_tbl %>% 
+    select(- symbol) %>% 
+    umap()
+
+#umap_results$layout
+
+# Store results as: umap_results 
+```
+
+Next, we want to combine the `layout` from the `umap_results` with the `symbol` column from the `stock_date_matrix_tbl`.
+
+- Start with `umap_results$layout`
+- Convert from a `matrix` data type to a `tibble` with `as_tibble()`
+- Bind the columns of the umap tibble with the `symbol` column from the `stock_date_matrix_tbl`.
+- Save the results as `umap_results_tbl`.
+
+```{r}
+# Convert umap results to tibble with symbols
+umap_results_tbl <- 
+    umap_results$layout %>% 
+    as_tibble() %>% 
+    set_names(c("X","Y")) %>% 
+    cbind(stock_date_matrix_tbl %>% select(symbol))
+
+# Output: 
+umap_results_tbl
+```
+
+Finally, let's make a quick visualization of the `umap_results_tbl`.
+
+- Pipe the `umap_results_tbl` into `ggplot()` mapping the `V1` and `V2` columns to x-axis and y-axis
+- Add a `geom_point()` geometry with an `alpha = 0.5`
+- Apply `theme_tq()` and add a title "UMAP Projection"
+
+```{r}
+# Visualize UMAP results
+
+umap_results_tbl %>% 
+    ggplot(aes(X,Y)) +
+    geom_point(alpha = 0.5, color = "blue") +
+    theme_tq()
+
+```
+
+We can now see that we have some clusters. However, we still need to combine the K-Means clusters and the UMAP 2D representation. 
+
+
+## Step 6 - Combine K-Means and UMAP
+
+Next, we combine the K-Means clusters and the UMAP 2D representation
+
+First, pull out the K-Means for 10 Centers. Use this since beyond this value the Scree Plot flattens. 
+
+- Begin with the `k_means_mapped_tbl`
+- Filter to `centers == 10`
+- Pull the `k_means` column
+- Pluck the first element
+- Store this as `k_means_obj`
+
+```{r}
+# Get the k_means_obj from the 10th center
+
+k_means_obj <- 
+    k_means_mapped_tbl %>% 
+    filter(centers == 10) %>% 
+    pull(k_means) %>% 
+    pluck(1)
+# Store as 
+#k_means_obj
+```
+
+Next, we'll combine the clusters from the `k_means_obj` with the `umap_results_tbl`.
+
+- Begin with the `k_means_obj`
+- Augment the `k_means_obj` with the `stock_date_matrix_tbl` to get the clusters added to the end of the tibble
+- Select just the `symbol` and `.cluster` columns
+- Left join the result with the `umap_results_tbl` by the `symbol` column
+- Left join the result with the result of `sp_500_index_tbl %>% select(symbol, company, sector)` by the `symbol` column. 
+- Store the output as `umap_kmeans_results_tbl`
+
+```{r}
+# Use your dplyr & broom skills to combine the k_means_obj with the umap_results_tbl
+umap_kmeans_results_tbl <- 
+    k_means_obj %>% augment(stock_date_matrix_tbl) %>% 
+    select(symbol, .cluster) %>% 
+    left_join(umap_results_tbl) %>% 
+    left_join(sp_500_index_tbl %>% select(symbol, company, sector))
+
+
+# Output: 
+umap_kmeans_results_tbl 
+```
+
+Plot the K-Means and UMAP results.
+
+- Begin with the `umap_kmeans_results_tbl`
+- Use `ggplot()` mapping `V1`, `V2` and `color = .cluster`
+- Add the `geom_point()` geometry with `alpha = 0.5`
+- Apply `theme_tq()` and `scale_color_tq()`
+
+
+# Visualize the combined K-Means and UMAP results Interactively to Exploring Clusters
+
+
+- `get_kmeans()`: Returns a data frame of UMAP and K-Means result for a value of `k`
+- `plot_cluster`: Returns an interactive `plotly` plot enabling exploration of the cluster and UMAP results. The only additional code you have not seen so far is the `ggplotly()` function. This is a topic for __Week 7: Communication__. 
+```{r}
+get_kmeans <- function(k = 3) {
+    
+    k_means_obj <- k_means_mapped_tbl %>%
+        filter(centers == k) %>%
+        pull(k_means) %>%
+        pluck(1)
+    
+    umap_kmeans_results_tbl <- k_means_obj %>% 
+        augment(stock_date_matrix_tbl) %>%
+        select(symbol, .cluster) %>%
+        left_join(umap_results_tbl, by = "symbol") %>%
+        left_join(sp_500_index_tbl %>% select(symbol, company, sector),
+                  by = "symbol")
+    
+    return(umap_kmeans_results_tbl)
+}
+
+plot_cluster <- function(k = 3) {
+    
+    g <- get_kmeans(k) %>%
+        
+        mutate(label_text = str_glue("Stock: {symbol}
+                                     Company: {company}
+                                     Sector: {sector}")) %>%
+        
+        ggplot(aes(X, Y, color = .cluster, text = label_text)) +
+        geom_point(alpha = 0.5) +
+        theme_tq()
+    
+    g %>%
+        ggplotly(tooltip = "text")
+    
+}
+```
+
+We can plot the clusters interactively. 
+
+```{r}
+plot_cluster(k = 10)
+```
+
+
+
